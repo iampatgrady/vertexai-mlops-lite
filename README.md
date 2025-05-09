@@ -126,3 +126,13 @@ To remove all resources created by this Terraform configuration, including the V
 terraform destroy
 ```
 Review the plan and confirm by typing yes when prompted. The helper script's destroy provisioner will run automatically to clean up the schedules before Terraform deletes the rest of the infrastructure.  
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
+
+## Disclaimer and No Support
+
+This code is provided "as-is" and without any express or implied warranties, including, but not limited to, the implied warranties of merchantability and fitness for a particular purpose. In no event shall the copyright holder be liable for any direct, indirect, incidental, special, exemplary, or consequential damages arising in any way out of the use of this software.
+
+This code is offered as a convenience and is not officially supported. While contributions (like bug reports or pull requests) are welcome, there is no guarantee of response, maintenance, or support for its usage in your environment. Customers requiring dedicated support should inquire about specific service agreements with Adswerve.
