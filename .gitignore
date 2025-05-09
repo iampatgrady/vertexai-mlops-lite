@@ -1,0 +1,78 @@
+# --- Terraform ---
+# State files - NEVER commit these directly! Use remote backend (GCS, Terraform Cloud)
+*.tfstate
+*.tfstate.*
+.terraform.*
+
+# Plan files (transient build artifacts)
+*.tfplan
+
+# Crash log
+crash.log
+
+# User-specific variables (commit .tfvars.example instead if needed)
+*.tfvars
+
+# Terraform internal directory (downloaded providers/modules)
+.terraform/
+
+# --- Python ---
+# Virtual environment directories
+.env/
+venv/
+env/
+ENV/
+*.venv
+
+# Python cache and compiled files
+__pycache__/
+*/__pycache__/
+*.py[cod] # Covers .pyc, .pyo, .pyd
+
+# --- KFP / Build Artifacts ---
+# Compiled pipeline YAML files.
+# It's generally better to commit the source Python files (.py)
+# and generate these YAML files during CI/CD or via the Terraform apply.
+# If you *definitely* want to track the exact compiled YAML, remove these lines.
+training_pipeline_dynamic.yaml
+prediction_pipeline_dynamic.yaml
+
+# --- IDE / Editor ---
+# VSCode
+.vscode/
+# PyCharm
+.idea/
+# Other common editor files
+*.swp
+*.swo
+*.suo
+*.user
+*.bak
+
+# --- OS Specific ---
+# MacOS
+.DS_Store
+# Windows
+Thumbs.db
+
+# --- Logs ---
+*.log
+
+# --- Credentials & Secrets ---
+# NEVER commit sensitive files. Use Secret Manager or other secure methods.
+# Add patterns for any potential local credential files you might create temporarily.
+*.pem
+*.key
+*creds*.json
+*secret*.json
+*credential*
+
+# --- Configuration ---
+# Ignore the actual config file to avoid committing secrets/project IDs.
+# Use config.yaml.example for the template.
+# config.yaml
+# sp_create_feature_metadata.sqlx
+# sp_create_training_inference_data.sqlx
+
+# --- Other ---
+# Add any other temporary files or build outputs specific to your workflow

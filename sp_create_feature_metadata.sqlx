@@ -1,0 +1,168 @@
+-- /vai-basic/sp_create_feature_metadata.sqlx
+-- Overwrites the original procedure with V2 logic/signature
+CREATE OR REPLACE PROCEDURE `{{ gcp_project_id }}.{{ bq_dataset_id }}.create_feature_metadata`(
+  -- --- Updated Signature (Matches V2 logic, but uses original procedure name) ---
+  OUT created_metadata_table STRING,      -- Return the actual metadata table created/used
+  OUT used_mapping_table STRING,          -- Return the actual mapping table created/used
+  IN sp_project_id STRING,                -- Project where this SP runs
+  IN sp_dataset_id STRING,               -- Dataset where this SP runs
+  IN analytics_project_id STRING,        -- Source GA4 Project
+  IN analytics_ga4_id STRING,            -- Source GA4 ID
+  IN analytics_ga4_stream_id STRING,     -- Source GA4 Stream ID
+  IN analysis_lookback_days INT64,       -- How many days back for analysis window
+  IN top_n_string_values INT64,          -- Top N string values to keep per feature
+  IN target_metadata_table_name STRING,  -- FULL name for the versioned metadata table (e.g., project.dataset.feature_metadata_runid)
+  IN target_mapping_table_name STRING    -- FULL name for the persistent mapping table (e.g., project.dataset.feature_value_mapping)
+  -- -----------------------------------------------------------------------------
+)
+BEGIN
+  DECLARE source_table_pattern STRING;
+  DECLARE sql_statement STRING;
+  DECLARE mapping_sql STRING;
+
+  -- 1. Set OUT parameters immediately (we assume we use the provided names)
+  SET created_metadata_table = target_metadata_table_name;
+  SET used_mapping_table = target_mapping_table_name;
+
+  -- 2. Construct source table pattern for GA4 data
+  SET source_table_pattern = CONCAT('`', analytics_project_id, '.analytics_', analytics_ga4_id, '.events_*`');
+
+  -- 3. Create the persistent mapping table IF it doesn't exist
+    EXECUTE IMMEDIATE """
+    CREATE TABLE IF NOT EXISTS `""" || target_mapping_table_name || """` (
+      original_value STRING,
+      value_hash STRING
+    )
+    OPTIONS(
+      description="Persistent mapping of original GA4 string parameter values to their SHA256 hashes used in feature names."
+    );
+  """;
+
+  -- 4. Define the main SQL statement to create the *versioned* metadata table
+  SET sql_statement = """
+    CREATE OR REPLACE TABLE `""" || target_metadata_table_name || """`
+    OPTIONS(
+        description="Analyzed GA4 event parameters for dynamic feature generation (Versioned: """ || target_metadata_table_name || """)",
+        -- *** REMOVED EXPIRATION_TIMESTAMP FROM HERE ***
+        labels=[("app", "mini-mlops"), ("pipeline_step", "feature-analysis")] -- Kept original label
+    )
+    AS (
+      WITH
+        EventParamTypes AS (
+          SELECT
+            e.event_name,
+            EP.key AS event_params_key,
+            CASE
+              WHEN EP.value.string_value IS NOT NULL THEN 'string_value'
+              WHEN EP.value.int_value IS NOT NULL THEN 'numeric_value'
+              WHEN EP.value.double_value IS NOT NULL THEN 'numeric_value'
+              WHEN EP.value.float_value IS NOT NULL THEN 'numeric_value'
+              ELSE NULL
+            END AS event_params_value_type,
+            EP.value.string_value,
+            COALESCE(EP.value.int_value, EP.value.double_value, EP.value.float_value) AS numeric_value
+          FROM
+            """ || source_table_pattern || """ AS e,
+            UNNEST(event_params) AS EP
+          WHERE
+            _TABLE_SUFFIX BETWEEN FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE(), INTERVAL @lookback DAY)) AND FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY))
+            AND e.stream_id = @stream_id
+            AND e.event_name NOT LIKE '%_id'
+            AND EP.key NOT LIKE '%_id'
+            AND e.event_name NOT LIKE 'gtm_%'
+            AND EP.key NOT LIKE 'gtm_%'
+            AND e.event_name NOT LIKE 'scroll%'
+            AND e.event_name <> 'click'
+            AND EP.key NOT IN ('page_title', 'page_location', 'page_referrer', 'ga_session_id', 'ga_session_number', 'session_engaged', 'term', 'campaign', 'source', 'gclid')
+        ),
+        StringValueCounts AS (
+          SELECT
+            event_name, event_params_key, event_params_value_type,
+            LOWER(NORMALIZE(string_value, NFKD)) AS normalized_string_value,
+            COUNT(*) AS unique_count
+          FROM EventParamTypes
+          WHERE event_params_value_type = 'string_value' AND string_value IS NOT NULL AND string_value != ''
+          GROUP BY 1, 2, 3, 4
+        ),
+        DistinctStringValuesToMap AS ( -- Kept CTE for clarity, could be merged into mapping logic
+          SELECT DISTINCT normalized_string_value
+          FROM StringValueCounts
+        ),
+        TopNStringValues AS (
+          SELECT
+            event_name, event_params_key, event_params_value_type,
+            ARRAY_AGG(STRUCT(normalized_string_value AS string_value, unique_count) ORDER BY unique_count DESC LIMIT @top_n) AS event_params_string_topN
+          FROM StringValueCounts GROUP BY 1, 2, 3
+        ),
+        NumericStats AS (
+          SELECT
+            event_name, event_params_key, event_params_value_type,
+            APPROX_QUANTILES(numeric_value, 100 IGNORE NULLS) AS percentiles,
+            MIN(numeric_value) AS min_value,
+            MAX(numeric_value) AS max_value,
+            COUNT(numeric_value) AS numeric_count
+          FROM EventParamTypes WHERE event_params_value_type = 'numeric_value' GROUP BY 1, 2, 3
+        ),
+        FilteredNumericStats AS (
+          SELECT * FROM NumericStats WHERE min_value IS NOT NULL AND max_value IS NOT NULL AND min_value <> max_value AND numeric_count > 10
+        )
+      -- Final Select for the metadata table
+      SELECT
+        ept.event_name, ept.event_params_key, ept.event_params_value_type, COUNT(*) AS occurrences,
+        topn.event_params_string_topN,
+        CASE
+          WHEN ept.event_params_value_type = 'numeric_value' AND ns.min_value IS NOT NULL THEN STRUCT( ns.min_value, ns.max_value, ns.percentiles[OFFSET(50)] AS median, ns.percentiles[OFFSET(95)] AS p95 )
+          ELSE NULL
+        END AS event_params_numeric_stats
+      FROM EventParamTypes AS ept
+      LEFT JOIN TopNStringValues AS topn ON ept.event_name = topn.event_name AND ept.event_params_key = topn.event_params_key AND ept.event_params_value_type = topn.event_params_value_type
+      LEFT JOIN FilteredNumericStats AS ns ON ept.event_name = ns.event_name AND ept.event_params_key = ns.event_params_key AND ept.event_params_value_type = ns.event_params_value_type
+      GROUP BY 1, 2, 3, 5, 6
+      HAVING (ept.event_params_value_type = 'string_value' AND ARRAY_LENGTH(topn.event_params_string_topN) > 1) OR (ept.event_params_value_type = 'numeric_value' AND event_params_numeric_stats IS NOT NULL)
+      ORDER BY occurrences DESC
+    )
+  """;
+
+  -- 5. Execute the statement to create the versioned metadata table
+  EXECUTE IMMEDIATE sql_statement
+  USING analysis_lookback_days AS lookback,
+        analytics_ga4_stream_id AS stream_id,
+        top_n_string_values AS top_n;
+
+  -- 6. Define and execute the MERGE statement to populate the mapping table
+  SET mapping_sql = """
+    MERGE `""" || target_mapping_table_name || """` AS T
+    USING (
+      -- Re-use the logic to find distinct normalized string values
+      WITH
+        EventParamTypes AS (
+          SELECT EP.value.string_value
+          FROM """ || source_table_pattern || """ AS e, UNNEST(event_params) AS EP
+          WHERE _TABLE_SUFFIX BETWEEN FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE(), INTERVAL @lookback DAY)) AND FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY))
+            AND e.stream_id = @stream_id
+            AND EP.value.string_value IS NOT NULL AND EP.value.string_value != ''
+            AND e.event_name NOT LIKE '%_id' AND EP.key NOT LIKE '%_id' AND e.event_name NOT LIKE 'gtm_%' AND EP.key NOT LIKE 'gtm_%' AND e.event_name NOT LIKE 'scroll%' AND e.event_name <> 'click' AND EP.key NOT IN ('page_title', 'page_location', 'page_referrer', 'ga_session_id', 'ga_session_number', 'session_engaged', 'term', 'campaign', 'source')
+        ),
+        StringValueCounts AS (
+          SELECT LOWER(NORMALIZE(string_value, NFKD)) AS normalized_string_value
+          FROM EventParamTypes
+          GROUP BY 1 -- Group by normalized value to get distinct ones
+        )
+      SELECT
+        normalized_string_value AS original_value,
+        -- Use the SAME hashing logic as in sp_create_training_inference_data
+        SUBSTR(TO_HEX(SHA256(normalized_string_value)), 1, 16) AS value_hash
+      FROM StringValueCounts
+    ) AS S
+    ON T.value_hash = S.value_hash -- Match based on the hash
+    WHEN NOT MATCHED THEN
+      INSERT (original_value, value_hash) VALUES (S.original_value, S.value_hash);
+    -- Optional: Add WHEN MATCHED THEN UPDATE logic if needed, e.g., update a timestamp
+  """;
+
+  -- Execute the MERGE statement
+  EXECUTE IMMEDIATE mapping_sql
+  USING analysis_lookback_days AS lookback,
+        analytics_ga4_stream_id AS stream_id;
+
+END;

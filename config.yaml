@@ -1,0 +1,47 @@
+# /vai-basic/config.yaml
+
+gcp_project_id: as-dev-pat
+gcp_region: us-central1
+bq_dataset_location: US
+bq_dataset_id: mini_mlops_demo_dynamic
+
+# --- Source GA4 Data Config ---
+analytics_ga4_project_id: doctor-rogers-data-warehouse
+analytics_ga4_id: "351329198"
+analytics_ga4_stream_id: "4457397172"
+
+# --- Feature Generation Config ---
+feature_generation:
+  analysis_lookback_days: 28
+  top_n_string_values: 10
+
+# --- Parameters passed TO the data creation stored procedure ---
+bq_sp_params:
+  lookback_days: 28
+  lookahead_days: 7
+
+model:
+  type: BQML
+  create_model_params:
+    model_type: BOOSTED_TREE_CLASSIFIER
+    num_trials: 5
+    max_parallel_trials: 2
+    auto_class_weights: TRUE
+    category_encoding_method: LABEL_ENCODING # for boosted trees
+    hparam_tuning_objectives: ['F1_SCORE']
+
+training:
+  cron: "0 12 * * 0"
+  # --- Choose ONE of the following date methods ---
+  # Option A: Specific Dates
+  # data_date_start: "2024-01-01"
+  # data_date_end: "2024-03-20"
+  # Option B: Relative Start Date (End date is implicitly 'today')
+  data_date_start_days_ago: 365 # Example: Use data starting 90 days ago until today
+
+prediction:
+  cron: "0 16 * * *"
+  # --- Use ONLY relative start date for prediction ---
+  data_date_start_days_ago: 3 # How far back from today to start the inference window
+  threshold: 0.5
+

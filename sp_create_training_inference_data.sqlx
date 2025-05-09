@@ -1,0 +1,127 @@
+-- /vai-basic/sp_create_training_inference_data.sqlx
+CREATE OR REPLACE PROCEDURE `{{ gcp_project_id }}.{{ bq_dataset_id }}.create_training_inference_data`(
+  IN target_table_name STRING,
+  IN feature_metadata_table STRING, -- Specific versioned metadata table
+  IN analytics_project_id STRING,
+  IN analytics_ga4_id STRING,
+  IN analytics_ga4_stream_id STRING,
+  IN date_start DATE,
+  IN date_end DATE,
+  IN mode STRING,
+  IN lookback_days_param INT64,
+  IN lookahead_days_param INT64
+)
+BEGIN
+  DECLARE dynamic_feature_select_sql STRING;
+  DECLARE final_create_base_sql STRING;
+  DECLARE query_to_build_dynamic_features STRING;
+
+  -- Static features remain the same
+  DECLARE static_feature_select_sql STRING DEFAULT '''
+      MAX(ga.traffic_source.medium) AS session_medium, MAX(ga.traffic_source.source) AS session_source, MAX(ga.traffic_source.name) AS session_campaign,
+      COUNTIF(ga.event_name = 'page_view') as pageviews, COUNTIF(ga.event_name = 'first_visit') as first_visits, COUNTIF(ga.event_name = 'session_start') as session_starts,
+      COUNTIF(ga.event_name = 'view_search_results') AS view_search_results, COUNT(DISTINCT IF(ga.event_name IN ('view_item','add_to_cart', 'purchase'), items.item_id, NULL)) AS unique_items_viewed,
+      SUM(IF(ga.event_name = 'add_to_cart', items.quantity, 0)) AS total_quantity_added_to_cart, COUNTIF(ga.event_name = 'view_item_list') AS view_item_list,
+      COUNTIF(ga.event_name = 'select_item') AS select_item, COUNTIF(ga.event_name = 'view_item') AS view_items, COUNTIF(ga.event_name = 'add_to_cart') AS add_to_carts,
+      COUNTIF(ga.event_name = 'remove_from_cart') AS remove_from_cart, COUNTIF(ga.event_name = 'select_promotion') AS select_promotion, COUNTIF(ga.event_name = 'view_promotion') AS view_promotions,
+      COUNTIF(ga.event_name = 'begin_checkout') AS begin_checkout, COUNTIF(ga.event_name = 'add_payment_info') AS add_payment_info, COUNTIF(ga.event_name = 'add_shipping_info') AS add_shipping_info,
+      COUNTIF(ga.event_name = 'search') AS search, COUNTIF(ga.event_name = 'refine_search') AS refine_search, COUNTIF((SELECT value.int_value FROM UNNEST(ga.event_params) AS ep WHERE ep.key = 'percent_scrolled')>=75) AS pctscrolled_ge75,
+      COUNTIF(ga.event_name = 'form_start') AS form_start, COUNTIF(REGEXP_CONTAINS(LOWER(ga.event_name), r'form_sub')) AS form_submit
+    ''';
+
+  -- Step 1: Build the SQL query string that will, when executed, generate the list of dynamic features.
+  SET query_to_build_dynamic_features = FORMAT("""
+    SELECT
+      CASE
+        WHEN COUNT(f.event_name) = 0 THEN NULL -- Handle case where no features are found from metadata
+        ELSE CONCAT(',', STRING_AGG( -- Prepend comma to the whole aggregated string if not empty
+                CASE
+                  WHEN f.event_params_value_type = 'numeric_value' THEN
+                    CONCAT('IF(IS_NAN(SUM(IF(ga.event_name = \\'', f.event_name, '\\', (SELECT COALESCE(ep.value.int_value, ep.value.float_value, ep.value.double_value) FROM UNNEST(ga.event_params) as ep WHERE ep.key = \\'', f.event_params_key, '\\'), NULL))), NULL, SUM(IF(ga.event_name = \\'', f.event_name, '\\', (SELECT COALESCE(ep.value.int_value, ep.value.float_value, ep.value.double_value) FROM UNNEST(ga.event_params) as ep WHERE ep.key = \\'', f.event_params_key, '\\'), NULL))) AS `num_', LOWER(REGEXP_REPLACE(f.event_name, r'[^a-zA-Z0-9_]', '_')), '_', LOWER(REGEXP_REPLACE(f.event_params_key, r'[^a-zA-Z0-9_]', '_')), '`')
+                  WHEN f.event_params_value_type = 'string_value' AND top_n_value.string_value IS NOT NULL THEN
+                    CONCAT('COUNTIF(ga.event_name = \\'', f.event_name, '\\' AND EXISTS(SELECT 1 FROM UNNEST(ga.event_params) AS ep WHERE ep.key = \\'', f.event_params_key, '\\' AND LOWER(NORMALIZE(ep.value.string_value, NFKD)) = \\'', top_n_value.string_value, '\\')) AS `str_', LOWER(REGEXP_REPLACE(f.event_name, r'[^a-zA-Z0-9_]', '_')), '_', LOWER(REGEXP_REPLACE(f.event_params_key, r'[^a-zA-Z0-9_]', '_')), '_', SUBSTR(TO_HEX(SHA256(top_n_value.string_value)), 1, 16), '`')
+                  ELSE NULL 
+                END
+                ORDER BY f.event_name, f.event_params_key, top_n_value.string_value 
+              ))
+      END
+    FROM
+      `%s` AS f 
+      LEFT JOIN UNNEST(IF(f.event_params_value_type = 'string_value', f.event_params_string_topN, [STRUCT<string_value STRING, unique_count INT64>(NULL, NULL)])) AS top_n_value
+    WHERE
+      (f.event_params_value_type = 'numeric_value')
+      OR (f.event_params_value_type = 'string_value' AND top_n_value.string_value IS NOT NULL)
+  """, feature_metadata_table); 
+
+  EXECUTE IMMEDIATE query_to_build_dynamic_features INTO dynamic_feature_select_sql;
+
+  -- Step 2: Construct the FULL SQL statement for creating the main dataset temp table
+  SET final_create_base_sql = FORMAT("""
+    CREATE OR REPLACE TEMP TABLE dataset_base AS (
+      WITH
+        VisitorPool AS (
+           SELECT
+              e.user_pseudo_id, MAX(TIMESTAMP_MICROS(e.event_timestamp)) as last_event_timestamp,
+              CASE WHEN MOD(ABS(FARM_FINGERPRINT(e.user_pseudo_id)), 100) < 70 THEN 'TRAIN' WHEN MOD(ABS(FARM_FINGERPRINT(e.user_pseudo_id)), 100) < 90 THEN 'EVAL' ELSE 'TEST' END as data_split,
+              ARRAY_AGG(STRUCT(e.device.category as device_category, e.device.operating_system as operating_system, e.device.language as device_language, e.device.web_info.browser as browser) ORDER BY e.event_timestamp DESC LIMIT 1 )[OFFSET(0)] as last_device_info
+          FROM `%s.analytics_%s.events_*` AS e 
+          WHERE SAFE.PARSE_DATE('%%Y%%m%%d', e._TABLE_SUFFIX) BETWEEN DATE_SUB(@start_date, INTERVAL @lookback DAY) AND DATE_ADD(@end_date, INTERVAL @lookahead DAY) AND e.stream_id = @stream_id -- CORRECTED HERE
+          GROUP BY e.user_pseudo_id HAVING MAX(SAFE.PARSE_DATE('%%Y%%m%%d', e._TABLE_SUFFIX)) BETWEEN @start_date AND @end_date -- CORRECTED HERE
+        ),
+        BaseSessions AS (
+          SELECT
+              ga.user_pseudo_id, ga.user_pseudo_id || '/' || ga.event_date || '/' || COALESCE((SELECT value.int_value FROM UNNEST(ga.event_params) WHERE key = "ga_session_id" LIMIT 1), -1) as session_id,
+              MIN(SAFE.PARSE_DATE('%%Y%%m%%d', ga._TABLE_SUFFIX)) as date, MIN(TIMESTAMP_MICROS(ga.event_timestamp)) as session_start_timestamp, MAX(TIMESTAMP_MICROS(ga.event_timestamp)) as session_end_timestamp, -- CORRECTED HERE
+              vp.data_split, vp.last_device_info,
+              %s                  
+              %s                  
+              , COUNTIF(ga.event_name = 'purchase') as purchases
+          FROM `%s.analytics_%s.events_*` as ga 
+          INNER JOIN VisitorPool vp ON ga.user_pseudo_id = vp.user_pseudo_id LEFT JOIN UNNEST(ga.items) AS items
+          WHERE SAFE.PARSE_DATE('%%Y%%m%%d', ga._TABLE_SUFFIX) BETWEEN DATE_SUB(@start_date, INTERVAL @lookback DAY) AND DATE_ADD(@end_date, INTERVAL @lookahead DAY) AND ga.stream_id = @stream_id -- CORRECTED HERE
+            AND TIMESTAMP_MICROS(ga.event_timestamp) BETWEEN TIMESTAMP_SUB(vp.last_event_timestamp, INTERVAL @lookback DAY) AND vp.last_event_timestamp
+          GROUP BY 1, 2, vp.data_split, vp.last_device_info
+        ),
+        ConversionLabels AS (
+           SELECT bs1.session_id, IF(SUM(bs2.purchases) >= 1, 1, 0) AS label
+          FROM BaseSessions bs1 LEFT JOIN BaseSessions bs2 ON bs1.user_pseudo_id = bs2.user_pseudo_id AND bs2.session_start_timestamp > bs1.session_end_timestamp AND bs2.session_start_timestamp <= TIMESTAMP_ADD(bs1.session_end_timestamp, INTERVAL @lookahead DAY)
+          GROUP BY 1
+        )
+      SELECT
+        bs.* EXCEPT(last_device_info, purchases, session_start_timestamp, session_end_timestamp), bs.last_device_info.device_category, bs.last_device_info.operating_system, bs.last_device_info.device_language, bs.last_device_info.browser,
+        FORMAT_TIMESTAMP('%%A', bs.session_start_timestamp, 'UTC') AS day_of_week, EXTRACT(HOUR FROM bs.session_start_timestamp AT TIME ZONE 'UTC') AS hour_of_day, -- CORRECTED HERE
+        CASE WHEN EXTRACT(HOUR FROM bs.session_start_timestamp AT TIME ZONE 'UTC') BETWEEN 6 AND 11 THEN 'Morning' WHEN EXTRACT(HOUR FROM bs.session_start_timestamp AT TIME ZONE 'UTC') BETWEEN 12 AND 17 THEN 'Afternoon' WHEN EXTRACT(HOUR FROM bs.session_start_timestamp AT TIME ZONE 'UTC') BETWEEN 18 AND 23 THEN 'Evening' ELSE 'Night' END as time_of_day_segment,
+        COALESCE(cl.label, 0) AS label
+      FROM BaseSessions bs LEFT JOIN ConversionLabels cl ON bs.session_id = cl.session_id
+      WHERE bs.date BETWEEN @start_date AND @end_date
+    );
+  """,
+  analytics_project_id,                 
+  analytics_ga4_id,                     
+  static_feature_select_sql,            
+  COALESCE(dynamic_feature_select_sql, ''), 
+  analytics_project_id,                 
+  analytics_ga4_id                      
+  );
+
+  -- Step 3: Execute the fully constructed SQL statement for the temp table
+  EXECUTE IMMEDIATE final_create_base_sql
+  USING date_start AS start_date, date_end AS end_date,
+        lookback_days_param AS lookback, lookahead_days_param AS lookahead,
+        analytics_ga4_stream_id AS stream_id;
+
+  -- Step 4: Create final Training or Inference table from the temp table
+  IF mode = 'TRAINING' THEN
+    EXECUTE IMMEDIATE FORMAT("""
+      CREATE OR REPLACE TABLE `%s` OPTIONS(expiration_timestamp=TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 7 DAY), labels=[("app", "mini-mlops"), ("pipeline_mode", "training")])
+      AS SELECT * EXCEPT(session_id) FROM dataset_base WHERE data_split != 'TEST' AND date <= DATE_SUB(@end_date, INTERVAL @lookahead DAY);
+      """, target_table_name)
+      USING date_end AS end_date, lookahead_days_param AS lookahead;
+  ELSEIF mode = 'INFERENCE' THEN
+      EXECUTE IMMEDIATE FORMAT("""
+      CREATE OR REPLACE TABLE `%s` OPTIONS(expiration_timestamp=TIMESTAMP_ADD(CURRENT_TIMESTAMP(), INTERVAL 1 DAY), labels=[("app", "mini-mlops"), ("pipeline_mode", "inference")])
+      AS SELECT * EXCEPT(label, data_split, session_id) FROM dataset_base WHERE date BETWEEN @start_date AND @end_date;
+      """, target_table_name)
+      USING date_start AS start_date, date_end AS end_date;
+  END IF;
+END;
