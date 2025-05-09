@@ -1,14 +1,14 @@
 # /vai-basic/config.yaml
 
-gcp_project_id: as-dev-pat
+gcp_project_id: your-project-id
 gcp_region: us-central1
 bq_dataset_location: US
-bq_dataset_id: mini_mlops_demo_dynamic
+bq_dataset_id: mini_mlops
 
 # --- Source GA4 Data Config ---
-analytics_ga4_project_id: doctor-rogers-data-warehouse
-analytics_ga4_id: "351329198"
-analytics_ga4_stream_id: "4457397172"
+analytics_ga4_project_id: ga4-bigquery-export-project
+analytics_ga4_id: "<ga4 property id>"
+analytics_ga4_stream_id: "<ga4 stream id>"
 
 # --- Feature Generation Config ---
 feature_generation:
