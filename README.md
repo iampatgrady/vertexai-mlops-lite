@@ -1,4 +1,4 @@
-# vai-basic: Minimalist Dynamic Feature BQML MLOps
+# vai-miniops: Minimalist BQML MLOps
 
 `vai-basic` is a starter MLOps framework on Google Cloud Platform, focusing on automating the lifecycle of a BigQuery ML model that uses dynamic features derived from Google Analytics 4 (GA4) data. It provides infrastructure provisioning via Terraform and pipeline orchestration using Vertex AI Pipelines (KFP v2), linked via a Python helper script.
 
