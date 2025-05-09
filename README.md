@@ -83,10 +83,6 @@ The framework's behavior and deployment targets are controlled by two types of f
     *   `./vai-basic/sp_create_training_inference_data.sqlx`
     *   These files are automatically processed by Terraform using the `jinja` provider to inject basic configuration (project and dataset IDs) before deploying the SPs to BigQuery.
     *   **You generally do not need to edit these files** unless you intend to change the core logic of how features are analyzed or data is prepared.
-    *   If you *do* modify the `.sqlx` files, you can perform a basic check of the Jinja syntax (not the SQL logic) using the included test script:
-        ```bash
-        python ./vai-basic/test_render_sqlx.py
-        ```
 
 Make sure your `config.yaml` is correctly filled out before proceeding to deployment.
 
